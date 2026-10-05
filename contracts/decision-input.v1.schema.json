@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mikolaj92/SkillDecision/contracts/decision-input.v1.schema.json",
+  "title": "SkillDecision input v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "context", "skills", "tools"],
+  "properties": {
+    "task": { "type": "string" },
+    "context": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "text"],
+        "properties": {
+          "role": { "enum": ["user", "assistant"] },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "skills": { "type": "array", "items": { "$ref": "#/$defs/resource" } },
+    "tools": { "type": "array", "items": { "$ref": "#/$defs/resource" } }
+  },
+  "$defs": {
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description"],
+      "properties": {
+        "id": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

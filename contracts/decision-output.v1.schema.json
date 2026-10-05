@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mikolaj92/SkillDecision/contracts/decision-output.v1.schema.json",
+  "title": "SkillDecision output v1",
+  "description": "Runtime validation also requires every selected identifier to exist in its corresponding input catalog.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["skills", "tools"],
+  "properties": {
+    "skills": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "tools": { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+  }
+}
