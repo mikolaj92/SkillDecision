@@ -14,6 +14,8 @@ import {
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import skillDecision from "../src/pi.ts";
 
+const TENSORFOLD_ENV_KEYS = ["TENSORFOLD_BASE_URL", "TENSORFOLD_MODEL", "TENSORFOLD_API_KEY"];
+
 async function runPi(options: {
   output?: string;
   cliArgs?: string[];
@@ -22,10 +24,18 @@ async function runPi(options: {
   manualOnly?: boolean;
   turns?: number;
   catalogDescription?: string;
+  decideUrl?: string;
   decideModel?: string;
+  noDecideFlags?: boolean;
+  env?: Record<string, string>;
+  authFails?: boolean;
+  stallBody?: boolean;
   mainVirtual?: boolean;
   virtualTarget?: "decision" | "bedrock";
-  classifier?: { api: string; incomplete?: boolean };
+  classifier?: { api: string };
+  commandsFixture?: boolean;
+  decisionResponse?: unknown;
+  missingUsage?: boolean;
   emptyCatalog?: boolean;
   hangDecision?: boolean;
   mainTool?: boolean;
@@ -44,12 +54,24 @@ async function runPi(options: {
   const skillContent = options.oversized ? "x".repeat(65537) :
     "---\nname: pdf\ndescription: Process PDF documents\n---\n# PDF\nVerify every extracted obligation.\n";
   await writeFile(skillPath, skillContent);
+  // A real models.json provider whose key is a shell command. Resolving it would
+  // create the marker file; the selector must never resolve it.
+  const marker = join(directory, "command-ran");
+  if (options.commandsFixture) {
+    await writeFile(join(directory, "models.json"), JSON.stringify({ providers: { commands: {
+      baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions",
+      apiKey: `!touch ${JSON.stringify(marker)}`,
+      models: [{ id: "decision" }],
+    } } }));
+  }
   const requests: Record<string, any>[] = [];
+  const paths: string[] = [];
+  const headers: Record<string, any>[] = [];
   const notifications: string[] = [];
   const decisionOptions: unknown[] = [];
   const routes = { decision: 0, main: 0 };
+  let registryOps = 0;
   let classifierCalls = 0;
-  let classifierState: unknown;
   let startDecision!: () => void;
   const decisionStarted = new Promise<void>((resolve) => { startDecision = resolve; });
   let startTool!: () => void;
@@ -62,9 +84,17 @@ async function runPi(options: {
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
     requests.push(payload);
-    const isDecision = payload.messages[0]?.content?.includes("resource selector");
+    paths.push(request.url!);
+    headers.push(request.headers);
+    const isDecision = request.url === "/v1/decisions" || payload.messages?.[0]?.content?.includes("resource selector");
     if (isDecision) startDecision();
     if (isDecision && options.hangDecision) return;
+    if (isDecision && options.stallBody) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.write('{"object":"decisions"');
+      return;
+    }
+    if (isDecision && options.decisionThrow) { request.socket.destroy(); return; }
     if (isDecision && options.decisionError) {
       response.writeHead(503, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: "fixture-private-provider-error" } }));
@@ -77,8 +107,24 @@ async function runPi(options: {
       response.end(JSON.stringify({ error: { message: "fixture main temporary error" } }));
       return;
     }
-    const text = isDecision ? (options.outputForTask?.(JSON.parse(payload.messages.at(-1).content).task) ??
+    const text = isDecision ? (options.outputForTask?.((payload.input ?? JSON.parse(payload.messages.at(-1).content)).task) ??
       options.output ?? '{"skills":["pdf"],"tools":["read"]}') : "Main agent answer";
+    if (request.url === "/v1/decisions") {
+      const selected = JSON.parse(text);
+      response.writeHead(200, { "Content-Type": "application/json" });
+      if (options.decisionResponse !== undefined) {
+        response.end(typeof options.decisionResponse === "string" ? options.decisionResponse : JSON.stringify(options.decisionResponse));
+        return;
+      }
+      response.end(JSON.stringify({ object: "decisions", model: payload.model, prompt_format_version: 1,
+        answers: Object.fromEntries(payload.questions.map((question: any) => {
+          const [kind, index] = question.id.split("_");
+          const resource = payload.input[kind === "skill" ? "skills" : "tools"][Number(index)];
+          const yes = selected[kind === "skill" ? "skills" : "tools"].includes(resource.id) ? 0.9 : 0.1;
+          return [question.id, { type: "yes_no", probabilities: { yes, no: 1 - yes }, label_mass: 0.8 }];
+        })), usage: options.missingUsage ? undefined : { prompt_tokens: 60, completion_tokens: 0, total_tokens: 60 } }));
+      return;
+    }
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(`data: ${JSON.stringify({ id: "test", object: "chat.completion.chunk", model: payload.model,
       choices: [{ index: 0, delta: useTool ? {
@@ -93,12 +139,19 @@ async function runPi(options: {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const savedEnv = TENSORFOLD_ENV_KEYS.map((key) => [key, process.env[key]] as const);
+  for (const key of TENSORFOLD_ENV_KEYS) delete process.env[key];
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    process.env[key] = value === "@fixture" ? baseUrl : value;
+  }
   let session: PiSession | undefined;
   try {
     const runtime = await ModelRuntime.create({ authPath: join(directory, "auth.json"),
-      modelsPath: null, modelsStorePath: join(directory, "models-store.json"), refreshOnCreate: false });
+      modelsPath: options.commandsFixture ? join(directory, "models.json") : null,
+      modelsStorePath: join(directory, "models-store.json"), refreshOnCreate: false });
     runtime.registerProvider("fixture", {
-      api: "openai-completions", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "fixture-not-a-secret",
+      api: "openai-completions", baseUrl, apiKey: "fixture-not-a-secret",
       models: [{ id: "decision", name: "Decision", reasoning: false, input: ["text"],
         cost: { input: 2, output: 4, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32000, maxTokens: 2000 },
         { id: "bedrock", name: "Bedrock", api: "bedrock-converse-stream", reasoning: false, input: ["text"],
@@ -113,8 +166,7 @@ async function runPi(options: {
     runtime.streamSimple = (model, context, callOptions) => {
       if (context.systemPrompt?.includes("resource selector")) {
         decisionOptions.push(callOptions);
-        // Never let a regression invoke the real AWS transport in this fixture.
-        if (options.decisionThrow || model.api === "bedrock-converse-stream") throw new Error("PRIVATE_PROVIDER_SECRET");
+        throw new Error("PRIVATE_PROVIDER_SECRET");
       }
       return originalStream(model, context, callOptions);
     };
@@ -122,25 +174,37 @@ async function runPi(options: {
       apiKey: "fixture-not-a-secret", models: [{ type: "classifier", id: "selector", name: "Selector",
         api: options.classifier.api, baseUrl: "http://127.0.0.1", input: ["text"], contextWindow: 32000,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-      classifiers: { [options.classifier.api]: { classify: async (model, context, callOptions) => {
+      classifiers: { [options.classifier.api]: { classify: async () => {
         classifierCalls++;
-        classifierState = context;
-        assert.equal(callOptions?.maxRetries, 0);
-        return { api: model.api, provider: model.provider, model: model.id, stopReason: "stop", timestamp: Date.now(),
-          answers: options.classifier?.incomplete ? {} : Object.fromEntries(Object.keys(context.questions).map((id) =>
-            [id, { type: "bool", probability: id === "skill_0" || id === "tool_0" ? 0.9 : 0.1 }])) };
+        throw new Error("Legacy classifiers must never be called");
       } } },
     });
     const settings = SettingsManager.inMemory({ compaction: { enabled: false },
       retry: { enabled: options.mainErrorOnce ?? false, maxRetries: 1, baseDelayMs: 1, provider: { maxRetries: 0 } } });
-    const parsed = parseArgs([...(options.cliArgs ?? []),
-      ...(options.decideModel ? ["--decide-model", options.decideModel] : [])]);
+    const cli = [...(options.cliArgs ?? [])];
+    if (!options.noDecideFlags) {
+      if (options.decideUrl ?? baseUrl) cli.push("--decide-url", options.decideUrl ?? baseUrl);
+      if (options.decideModel ?? "decision") cli.push("--decide-model", options.decideModel ?? "decision");
+    }
+    const parsed = parseArgs(cli);
     assert.deepEqual(parsed.diagnostics, []);
     const services = await createAgentSessionServices({ cwd: directory, agentDir: directory,
       modelRuntime: runtime, settingsManager: settings, extensionFlagValues: parsed.unknownFlags,
       resourceLoaderOptions: {
         noContextFiles: true, noPromptTemplates: true, noThemes: true,
         extensionFactories: [skillDecision, (pi) => {
+          pi.on("session_start", (_event, ctx) => {
+            // Count every registry selector operation; the direct config uses none.
+            const registry = ctx.modelRegistry as unknown as Record<string, (...args: unknown[]) => unknown>;
+            const find = registry.find.bind(registry);
+            const auth = registry.getApiKeyAndHeaders.bind(registry);
+            registry.find = (...args: unknown[]) => { registryOps++; return find(...args); };
+            registry.getApiKeyAndHeaders = async (...args: unknown[]) => { registryOps++; return auth(...args); };
+            if (options.authFails) registry.getApiKeyAndHeaders = async () => {
+              registryOps++;
+              return { ok: false, error: "PRIVATE_AUTH_ERROR" };
+            };
+          });
           pi.on("message_end", (event) => { if (event.message.role === "user") event.message.timestamp = 123; });
           pi.on("tool_call", async () => {
             if (options.mainTool) { startTool(); await toolGate; }
@@ -175,14 +239,118 @@ async function runPi(options: {
     } else await session.prompt("/decide stats");
     assert.deepEqual(session.getActiveToolNames(), toolsBefore);
     assert.equal(await readFile(skillPath, "utf8"), skillContent);
-    return { requests, entries: session.sessionManager.getBranch(), classifierCalls, classifierState, decisionOptions, notifications, routes };
+    return { requests, paths, headers, entries: session.sessionManager.getBranch(), classifierCalls,
+      decisionOptions, notifications, routes, registryOps, baseUrl, marker };
   } finally {
     session?.dispose();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await rm(directory, { recursive: true, force: true });
   }
 }
+
+test("TensorFold selects skills and tools with one env-authenticated POST, never a chat selector", async () => {
+  const { requests, paths, headers, decisionOptions } = await runPi({ env: { TENSORFOLD_API_KEY: "fixture-key" } });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(headers[0].authorization, "Bearer fixture-key");
+  assert.equal(decisionOptions.length, 0);
+  assert.equal(requests[0].prompt_format_version, 1);
+  assert.deepEqual(requests[0].questions.map((question: any) => [question.id, question.type]),
+    [["skill_0", "yes_no"], ["tool_0", "yes_no"], ["tool_1", "yes_no"]]);
+  assert.equal(requests[0].input.task, "Extract obligations from the PDF");
+  assert.match(JSON.stringify(requests[1].messages), /Verify every extracted obligation/);
+});
+
+test("without TENSORFOLD_API_KEY the selector sends no Authorization header", async () => {
+  const { paths, headers, entries } = await runPi();
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(headers[0].authorization, undefined);
+  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+  assert.equal((audit as any).data.status, "selected");
+});
+
+test("TENSORFOLD_API_KEY is read at request time as one bearer token, never a comma list", async () => {
+  const { paths, headers } = await runPi({ env: { TENSORFOLD_API_KEY: "one,two" },
+    run: async (session) => {
+      await session.prompt("Extract obligations from the PDF");
+      process.env.TENSORFOLD_API_KEY = "three";
+      await session.prompt("Do the same for another PDF");
+    } });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions", "/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(headers[0].authorization, "Bearer one,two", "a comma value is one verbatim token");
+  assert.equal(headers[2].authorization, "Bearer three", "the key is re-read for each decision");
+});
+
+test("TENSORFOLD_BASE_URL and TENSORFOLD_MODEL configure the selector without CLI flags", async () => {
+  const { paths, requests } = await runPi({ noDecideFlags: true,
+    env: { TENSORFOLD_BASE_URL: "@fixture", TENSORFOLD_MODEL: "decision" } });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(requests[0].model, "decision");
+});
+
+test("CLI --decide-url and --decide-model take precedence over environment defaults", async () => {
+  const { paths, requests, entries } = await runPi({
+    env: { TENSORFOLD_BASE_URL: "ftp://example.com/v1", TENSORFOLD_MODEL: "wrong" } });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(requests[0].model, "decision");
+  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+  assert.equal((audit as any).data.status, "selected");
+});
+
+test("missing URL, missing model and legacy auto never select through the main chat model", async () => {
+  for (const [decideUrl, decideModel, reason] of [
+    ["", "decision", "DECISION_NOT_CONFIGURED"],
+    [undefined, "", "DECISION_NOT_CONFIGURED"],
+    [undefined, "auto", "INVALID_MODEL_ADDRESS"],
+  ] as const) {
+    const { paths, entries, decisionOptions } = await runPi({ decideUrl, decideModel });
+    assert.deepEqual(paths, ["/v1/chat/completions"]);
+    assert.equal(decisionOptions.length, 0);
+    const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+    assert.equal((audit as any).data.reason, reason);
+  }
+});
+
+test("Pi authentication failure does not touch the selector", async () => {
+  const { paths, headers, entries } = await runPi({ authFails: true, env: { TENSORFOLD_API_KEY: "fixture-key" } });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(headers[0].authorization, "Bearer fixture-key");
+  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+  assert.equal((audit as any).data.status, "selected");
+  assert(!JSON.stringify(entries).includes("PRIVATE_AUTH_ERROR"));
+});
+
+test("a real !command provider is never resolved while /v1/decisions executes", async () => {
+  const { paths, marker, registryOps, requests, entries } = await runPi({ commandsFixture: true });
+  assert.equal(paths[0], "/v1/decisions", "the decision must execute");
+  assert.equal(requests.length, 2);
+  await assert.rejects(readFile(marker), /ENOENT/, "the !command marker must never be created");
+  assert.equal(registryOps, 0, "no registry lookup, auth resolution, or headers for the selector");
+  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+  assert.equal((audit as any).data.status, "selected");
+});
+
+test("TensorFold deadline covers a stalled response body with no selector retry", async () => {
+  const setTimer = globalThis.setTimeout;
+  const timerMock = mock.method(globalThis, "setTimeout", (callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    if (delay === 15000 || delay === 30000) {
+      assert.equal(delay, 30000, "selection and loading must share the 30-second deadline");
+      return setTimer(callback, 100, ...args);
+    }
+    return setTimer(callback, delay, ...args);
+  });
+  try {
+    const { paths, entries } = await runPi({ stallBody: true });
+    assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+    const audits = entries.filter((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+    assert.equal(audits.length, 1);
+    assert.equal((audits[0] as any).data.reason, "DECISION_TIMEOUT");
+  } finally { timerMock.mock.restore(); }
+});
 
 test("actual session.abort cancels a hung selector before the main provider is called", async () => {
   const { requests, entries } = await runPi({ hangDecision: true, run: async (session, { decisionStarted }) => {
@@ -191,7 +359,7 @@ test("actual session.abort cancels a hung selector before the main provider is c
     let completed = false;
     const stopped = session.abort().then(async () => { await pending; completed = true; });
     await Promise.race([stopped, new Promise((resolve) => setTimeout(resolve, 200))]);
-    assert.equal(completed, true, "session.abort must stop the selector, not wait for its 15-second timeout");
+    assert.equal(completed, true, "session.abort must stop the selector, not wait for its 30-second timeout");
     await stopped;
   } });
   assert.equal(requests.length, 1, "aborting selection must never call the main provider");
@@ -209,33 +377,27 @@ test("Pi makes one isolated decision, loads selected skill and preserves its too
   assert(entries.some((entry) => entry.type === "custom" && entry.customType === "skill-decision"));
 });
 
-test("/decide stats reports separate branch usage with the physical decision model", async () => {
-  const { entries, notifications } = await runPi({ turns: 2, decideModel: "fixture/decision" });
+test("/decide stats reports TensorFold tokens without inventing cost or cache usage", async () => {
+  const { entries, notifications } = await runPi({ turns: 2 });
   const stats = JSON.parse(notifications.at(-1)!);
   assert.equal(stats.decisions, 2);
   assert.equal(stats.selected, 2);
   assert.equal(stats.fallback, 0);
   assert.equal(stats.unknownUsage, 0);
-  const { cost, ...tokens } = stats.usage;
-  assert.deepEqual(tokens, { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 60 });
-  assert(Math.abs(cost.input - 0.00008) < 1e-12);
-  assert(Math.abs(cost.output - 0.00008) < 1e-12);
-  assert(Math.abs(cost.total - 0.00016) < 1e-12);
-  assert.equal(cost.cacheRead, 0);
-  assert.equal(cost.cacheWrite, 0);
+  assert.deepEqual(stats.usage, { input: 120, output: 0, totalTokens: 120 });
+  assert.equal(stats.unknownCost, 2);
   assert.equal(stats.footerIncludesDecisionCost, false);
   const audits = entries.filter((entry) => entry.type === "custom" && entry.customType === "skill-decision");
   for (const entry of audits) {
-    assert.equal((entry as any).data.provider, "fixture");
+    assert.equal((entry as any).data.backend, "tensorfold");
+    assert.equal((entry as any).data.provider, "tensorfold");
     assert.equal((entry as any).data.model, "decision");
   }
   assert(!entries.some((entry) => entry.type === "usage"));
 });
 
 test("/decide stats counts missing usage instead of treating failed requests as free", async () => {
-  for (const options of [{ decisionError: true }, {
-    decideModel: "classify-fixture/selector", classifier: { api: "fixture-classify" },
-  }]) {
+  for (const options of [{ decisionError: true }, { missingUsage: true }]) {
     const { notifications } = await runPi(options);
     const stats = JSON.parse(notifications.at(-1)!);
     assert.equal(stats.decisions, 1);
@@ -262,7 +424,7 @@ test("the decision deadline covers stalled file loading without late audit write
     syncBuiltinESMExports();
     const setTimer = globalThis.setTimeout;
     const timerMock = mock.method(globalThis, "setTimeout", (callback: (...args: any[]) => void, delay?: number, ...args: any[]) =>
-      setTimer(callback, delay === 15000 ? 100 : delay, ...args));
+      setTimer(callback, delay === 30000 ? 100 : delay, ...args));
     try {
       let completed = false;
       const pending = session.prompt("Extract obligations from the PDF").then(() => { completed = true; });
@@ -388,9 +550,9 @@ test("session.abort during stalled file loading finishes once and closes the lat
 
 test("unexpected provider exceptions use a named fallback without copying secret error text", async () => {
   const { entries, requests } = await runPi({ decisionThrow: true });
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
   const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
-  assert.equal((audit as any).data.reason, "DECISION_FAILED");
+  assert.equal((audit as any).data.reason, "DECISION_NETWORK_FAILED");
   assert(!JSON.stringify(entries).includes("PRIVATE_PROVIDER_SECRET"));
 });
 
@@ -400,42 +562,32 @@ test("/decide stats emits JSON when Pi runs without a UI", async () => {
   assert.equal(JSON.parse(notifications[0]).decisions, 1);
 });
 
-test("decision transport is SSE with zero retries even when the provider fails", async () => {
-  const { requests, entries, decisionOptions } = await runPi({ decisionError: true });
+test("TensorFold HTTP failure makes no retry or chat-selector fallback", async () => {
+  const { requests, paths, entries, decisionOptions } = await runPi({ decisionError: true });
   assert.equal(requests.length, 2, "one failed decision request plus one main request");
-  assert.equal(decisionOptions.length, 1);
-  assert.equal((decisionOptions[0] as any).transport, "sse");
-  assert.equal((decisionOptions[0] as any).maxRetries, 0);
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(decisionOptions.length, 0);
   const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
-  assert.equal((audit as any).data.reason, "DECISION_MODEL_FAILED");
+  assert.equal((audit as any).data.reason, "DECISION_HTTP_FAILED");
   assert(!JSON.stringify(entries).includes("fixture-private-provider-error"));
 });
 
-test("Bedrock decisions fall back before invoking a transport that ignores zero retries", async () => {
-  const { requests, entries, decisionOptions } = await runPi({ decideModel: "fixture/bedrock" });
-  assert.equal(decisionOptions.length, 0, "unsupported transport must not be invoked");
-  assert.equal(requests.length, 1, "the main model must still run");
-  const audits = entries.filter((entry) => entry.type === "custom" && entry.customType === "skill-decision");
-  assert.equal(audits.length, 1);
-  assert.equal((audits[0] as any).data.reason, "DECISION_TRANSPORT_UNSUPPORTED");
-  assert(!JSON.stringify(requests[0].messages).includes("Resources selected for the current task"));
+test("a slash model ID is sent verbatim as the TensorFold wire model", async () => {
+  const { paths, requests, decisionOptions, entries } = await runPi({ decideModel: "meta-llama/Llama-3.1-8B-Instruct" });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.equal(decisionOptions.length, 0);
+  assert.equal(requests[0].model, "meta-llama/Llama-3.1-8B-Instruct");
+  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+  assert.equal((audit as any).data.status, "selected");
+  assert.equal((audit as any).data.model, "meta-llama/Llama-3.1-8B-Instruct");
 });
 
-test("virtual decision models fall back before routing while the main virtual model still routes", async () => {
-  for (const options of [
-    { decideModel: "fixture/virtual", virtualTarget: "decision" },
-    { decideModel: "fixture/virtual", virtualTarget: "bedrock" },
-    { mainVirtual: true },
-  ] as const) {
-    const { requests, entries, decisionOptions, routes } = await runPi(options);
-    assert.equal(routes.decision, 0, "isolated decisions must not invoke the router");
-    assert.equal(routes.main, options.mainVirtual ? 1 : 0);
-    assert.equal(decisionOptions.length, 0);
-    assert.equal(requests.length, 1, "only the main model may call its provider");
-    const audits = entries.filter((entry) => entry.type === "custom" && entry.customType === "skill-decision");
-    assert.equal(audits.length, 1);
-    assert.equal((audits[0] as any).data.reason, "VIRTUAL_DECISION_MODEL_UNSUPPORTED");
-    assert(!JSON.stringify(requests[0].messages).includes("Resources selected for the current task"));
+test("an invalid decision endpoint falls back without any selector request", async () => {
+  for (const decideUrl of ["ftp://example.com/v1", "https://user:pass@example.com/v1", "https://example.com", "not a URL"]) {
+    const { paths, entries } = await runPi({ decideUrl });
+    assert.deepEqual(paths, ["/v1/chat/completions"]);
+    const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+    assert.equal((audit as any).data.reason, "INVALID_DECISION_ENDPOINT");
   }
 });
 
@@ -446,8 +598,8 @@ test("tool follow-ups reuse one persisted decision and leave raw user messages u
     releaseTool();
     await pending;
   } });
-  const selections = requests.filter((request) => request.messages[0].content.includes("resource selector"));
-  const main = requests.filter((request) => !request.messages[0].content.includes("resource selector"));
+  const selections = requests.filter((request) => request.questions);
+  const main = requests.filter((request) => request.messages);
   assert.equal(selections.length, 1, "tool continuation must not select again");
   assert.equal(main.length, 2);
   for (const request of main) {
@@ -492,10 +644,10 @@ test("compaction without a projected user restores the current enrichment withou
         await session.prompt("Now write a plain greeting");
       },
     });
-    const selections = requests.filter((request) => request.messages[0].content.includes("resource selector"));
-    assert.deepEqual(selections.map((request) => JSON.parse(request.messages.at(-1).content).task),
+    const selections = requests.filter((request) => request.questions);
+    assert.deepEqual(selections.map((request) => request.input.task),
       ["Extract obligations from the PDF", "Now write a plain greeting"]);
-    const main = requests.filter((request) => !request.messages[0].content.includes("resource selector"));
+    const main = requests.filter((request) => request.messages);
     assert.equal(main.length, 3, `${retain}-first compaction must preserve the tool continuation`);
     const enrichments = main.slice(0, 2).map((request) => request.messages.filter((message: any) =>
       JSON.stringify(message.content).includes("Resources selected for the current task")));
@@ -530,13 +682,13 @@ test("context omissions never revive a previous task's enrichment", async () => 
         }
       },
     });
-    const main = requests.filter((request) => !request.messages[0].content.includes("resource selector"));
+    const main = requests.filter((request) => request.messages);
     for (const request of main.slice(1)) {
       const enrichments = request.messages.filter((message: any) =>
         JSON.stringify(message.content).includes("Resources selected for the current task"));
       assert(!JSON.stringify(enrichments).includes("Verify every extracted obligation"), "an omitted boundary must not revive the PDF task");
     }
-    assert.equal(requests.filter((request) => request.messages[0].content.includes("resource selector")).length, 2);
+    assert.equal(requests.filter((request) => request.questions).length, 2);
     if (omit !== "assistant") {
       assert(!JSON.stringify(main.at(-1)!.messages).includes("Resources selected for the current task"), "an explicitly omitted user must not restore its audit");
     }
@@ -557,14 +709,14 @@ test("queued steering and followUp each get one decision by source id, not times
       await pending;
     },
   });
-  const selections = requests.filter((request) => request.messages[0].content.includes("resource selector"));
-  assert.deepEqual(selections.map((request) => JSON.parse(request.messages.at(-1).content).task),
+  const selections = requests.filter((request) => request.questions);
+  assert.deepEqual(selections.map((request) => request.input.task),
     ["Extract obligations from the PDF", "Queued steering", "Queued steering", "Queued follow-up"]);
   const users = entries.filter((entry) => entry.type === "message" && entry.message.role === "user");
   assert.equal(new Set(users.map((entry) => (entry as any).message.timestamp)).size, 1);
   const audits = entries.filter((entry) => entry.type === "custom" && entry.customType === "skill-decision");
   assert.deepEqual(audits.map((entry) => (entry as any).data.targetId), users.map((entry) => entry.id));
-  for (const request of requests.filter((request) => !request.messages[0].content.includes("resource selector")).slice(1)) {
+  for (const request of requests.filter((request) => request.messages).slice(1)) {
     const enrichments = request.messages.filter((message: any) => JSON.stringify(message.content).includes("Resources selected for the current task"));
     assert(enrichments.length > 0);
     assert(!JSON.stringify(enrichments).includes("Verify every extracted obligation"), "old enrichment must not leak into queued turns");
@@ -592,7 +744,7 @@ test("a queued user batch keeps every current decision through compaction and to
       unsubscribe();
     },
   });
-  const main = requests.filter((request) => !request.messages[0].content.includes("resource selector"));
+  const main = requests.filter((request) => request.messages);
   assert.equal(main.length, 3);
   for (const request of main.slice(1)) {
     const enrichments = request.messages.filter((message: any) => JSON.stringify(message.content).includes("Resources selected for the current task"));
@@ -637,13 +789,14 @@ test("/decide stats aggregates only the active branch, not abandoned decisions",
   } }).then(({ notifications }) => {
     const stats = JSON.parse(notifications.at(-1)!);
     assert.equal(stats.decisions, 1);
-    assert.equal(stats.usage.totalTokens, 30);
+    assert.equal(stats.usage.totalTokens, 60);
   });
 });
 
-test("malformed or invented selections fall back without retry or enrichment", async () => {
-  for (const output of ["not JSON", '{"skills":["made-up"],"tools":[]}', '{"skills":[],"tools":["deploy"]}']) {
-    const { requests, entries } = await runPi({ output });
+test("malformed or invented TensorFold answers fall back without retry or enrichment", async () => {
+  for (const decisionResponse of ["not JSON", { object: "decisions", model: "decision", prompt_format_version: 1,
+    answers: { invented: { type: "yes_no", probabilities: { yes: 1, no: 0 }, label_mass: 1 } } }]) {
+    const { requests, entries } = await runPi({ decisionResponse });
     assert.equal(requests.length, 2);
     assert(!JSON.stringify(requests[1].messages).includes("Verify every extracted obligation"));
     assert(!entries.some((entry) => entry.type === "custom_message" && entry.customType === "skill-decision-context"));
@@ -662,7 +815,7 @@ test("unreadable and oversized skills fall back before injecting partial context
 });
 
 test("CLI --decide-disabled prevents selection even after /decide on", async () => {
-  const { requests, entries, decisionOptions, notifications } = await runPi({
+  const { requests, entries, decisionOptions, notifications, baseUrl } = await runPi({
     cliArgs: ["--decide-disabled"], run: async (session) => {
       await session.prompt("/decide status");
       await session.prompt("Answer without resource selection");
@@ -676,11 +829,11 @@ test("CLI --decide-disabled prevents selection even after /decide on", async () 
   assert.equal(requests.length, 2, "only the two main requests may reach the provider");
   assert(requests.every((request) => !JSON.stringify(request.messages).includes("Resources selected for the current task")));
   assert(!entries.some((entry) => entry.type === "custom" && entry.customType === "skill-decision"));
-  assert.deepEqual(notifications.slice(0, 3), Array(3).fill("decide: off; model=auto"));
+  assert.deepEqual(notifications.slice(0, 3), Array(3).fill(`decide: off; url=${baseUrl}; model=decision`));
 });
 
 test("/decide on, off and status control only the isolated selector", async () => {
-  const { requests, entries, notifications } = await runPi({ run: async (session) => {
+  const { requests, entries, notifications, baseUrl } = await runPi({ run: async (session) => {
     await session.prompt("/decide status");
     await session.prompt("/decide off");
     await session.prompt("/decide status");
@@ -689,7 +842,8 @@ test("/decide on, off and status control only the isolated selector", async () =
     await session.prompt("/decide status");
     await session.prompt("Extract obligations from the PDF");
   } });
-  assert.deepEqual(notifications.slice(0, 5), ["on", "off", "off", "on", "on"].map((state) => `decide: ${state}; model=auto`));
+  const line = (state: string) => `decide: ${state}; url=${baseUrl}; model=decision`;
+  assert.deepEqual(notifications.slice(0, 5), ["on", "off", "off", "on", "on"].map(line));
   assert.equal(requests.length, 3, "two main requests and one isolated decision");
   assert(!JSON.stringify(requests[0].messages).includes("Resources selected for the current task"));
   assert.match(JSON.stringify(requests[2].messages), /Verify every extracted obligation/);
@@ -698,14 +852,14 @@ test("/decide on, off and status control only the isolated selector", async () =
 
 test("manual-only skills never reach the automatic selector", async () => {
   const { requests } = await runPi({ manualOnly: true, output: '{"skills":[],"tools":["read"]}' });
-  const input = JSON.parse(requests[0].messages.at(-1).content);
+  const input = requests[0].input;
   assert.deepEqual(input.skills, []);
 });
 
 test("each user turn makes one decision and includes recent conversation", async () => {
   const { requests } = await runPi({ turns: 2 });
   assert.equal(requests.length, 4);
-  const input = JSON.parse(requests[2].messages.at(-1).content);
+  const input = requests[2].input;
   assert(input.context.some((item: { text: string }) => item.text.includes("Extract obligations")));
   assert(input.context.some((item: { text: string }) => item.text === "Main agent answer"));
 });
@@ -721,9 +875,9 @@ test("selector context distinguishes retained-none compaction and branch summari
         else session.sessionManager.branchWithSummary(null, summary);
         await session.prompt("Extract obligations from it");
       } });
-      const selections = requests.filter((request) => request.messages[0].content.includes("resource selector"));
+      const selections = requests.filter((request) => request.questions);
       assert.equal(selections.length, 1, "summaries must not create extra tasks");
-      const input = JSON.parse(selections[0].messages.at(-1).content);
+      const input = selections[0].input;
       assert.equal(input.task, "Extract obligations from it");
       assert.equal(input.context.length, 2);
       assert.equal(input.context[0].role, "assistant");
@@ -737,42 +891,21 @@ test("selector context distinguishes retained-none compaction and branch summari
   }
 });
 
-test("an explicit classifier makes one classify call without a chat decision", async () => {
-  const { requests, entries, classifierCalls, classifierState } = await runPi({
-    decideModel: "classify-fixture/selector", classifier: { api: "fixture-classify" },
-  });
-  assert.equal(classifierCalls, 1);
-  assert.equal(requests.length, 1);
-  assert.match(JSON.stringify(requests[0].messages), /Verify every extracted obligation/);
-  assert.match(JSON.stringify(classifierState), /Extract obligations/);
-  assert(!entries.some((entry) => entry.type === "custom_message" && entry.customType === "skill-decision-context"));
-});
-
-test("an incomplete classifier result falls back without a second model call", async () => {
-  const { requests, entries, classifierCalls } = await runPi({
-    decideModel: "classify-fixture/selector", classifier: { api: "fixture-classify", incomplete: true },
-  });
-  assert.equal(classifierCalls, 1);
-  assert.equal(requests.length, 1);
-  assert(!entries.some((entry) => entry.type === "custom_message" && entry.customType === "skill-decision-context"));
-});
-
-test("llama.cpp classifier fanout is rejected before making a decision call", async () => {
-  const { requests, entries, classifierCalls } = await runPi({
-    decideModel: "classify-fixture/selector", classifier: { api: "llama-cpp-classify" },
-  });
-  assert.equal(classifierCalls, 0);
-  assert.equal(requests.length, 1);
-  const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
-  assert(audit && audit.type === "custom");
-  assert.equal((audit.data as { reason: string }).reason, "CLASSIFIER_FANOUT_UNSUPPORTED");
-});
-
-test("unknown or malformed model configuration falls back without guessing a provider", async () => {
-  for (const decideModel of ["missing/selector", "not-an-address", "provider/"]) {
-    const { requests } = await runPi({ decideModel });
-    assert.equal(requests.length, 1);
+test("legacy classifier backends are never invoked as substitutes for TensorFold", async () => {
+  for (const api of ["fixture-classify", "llama-cpp-classify"]) {
+    const { requests, entries, classifierCalls } = await runPi({ classifier: { api } });
+    assert.equal(classifierCalls, 0);
+    assert.equal(requests.filter((request) => request.questions).length, 1,
+      "the direct --decide-url endpoint still answers the decision");
+    const audit = entries.find((entry) => entry.type === "custom" && entry.customType === "skill-decision");
+    assert.equal((audit as any).data.status, "selected");
   }
+});
+
+test("the main model may use virtual routing while TensorFold selects separately", async () => {
+  const { paths, routes } = await runPi({ mainVirtual: true });
+  assert.deepEqual(paths, ["/v1/decisions", "/v1/chat/completions"]);
+  assert.deepEqual(routes, { decision: 0, main: 1 });
 });
 
 test("an empty catalog skips the selector", async () => {

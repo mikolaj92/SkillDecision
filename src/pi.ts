@@ -1,16 +1,17 @@
-import { open, readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext, Skill } from "@earendil-works/pi-coding-agent";
-import type { Usage } from "@earendil-works/pi-ai";
-import { buildQuestions, classifierDecision, decide, validateDecision } from "./decision.ts";
+import { decide, validateDecision } from "./decision.ts";
+import { tensorFoldDecision } from "./tensorfold.ts";
+import type { DecisionUsage } from "./tensorfold.ts";
 import type { DecisionInput } from "./decision.ts";
 
 const MAX_SKILL_BYTES = 64 * 1024;
 const MAX_CONTEXT_CHARS = 128 * 1024;
-const TIMEOUT_MS = 15_000;
+const TIMEOUT_MS = 30_000;
 const FALLBACK_REASONS = new Set([
-  "CATALOG_TOO_LARGE", "CLASSIFIER_FANOUT_UNSUPPORTED", "CLASSIFIER_FAILED", "INVALID_CLASSIFIER_RESULT",
-  "INVALID_MODEL_ADDRESS", "MODEL_UNAVAILABLE", "DECISION_TRANSPORT_UNSUPPORTED", "VIRTUAL_DECISION_MODEL_UNSUPPORTED",
-  "DECISION_MODEL_FAILED", "INVALID_DECISION_JSON",
+  "CATALOG_TOO_LARGE", "DECISION_HTTP_FAILED", "DECISION_NETWORK_FAILED",
+  "INVALID_TENSORFOLD_JSON", "INVALID_TENSORFOLD_RESULT", "INVALID_DECISION_ENDPOINT", "DECISION_RESPONSE_TOO_LARGE",
+  "DECISION_NOT_CONFIGURED", "INVALID_MODEL_ADDRESS",
   "INVALID_DECISION", "SKILL_TOO_LARGE", "ENRICHMENT_TOO_LARGE",
 ]);
 
@@ -50,18 +51,16 @@ async function loadSkill(skill: Skill, signal: AbortSignal) {
   }
 }
 
-function modelAddress(value: string): [string, string] {
-  const slash = value.indexOf("/");
-  if (slash < 1 || slash === value.length - 1) throw new Error("INVALID_MODEL_ADDRESS");
-  return [value.slice(0, slash), value.slice(slash + 1)];
-}
-
 export default function skillDecision(pi: ExtensionAPI) {
   let enabled = true;
   let catalog: Skill[] = [];
+  pi.registerFlag("decide-url", {
+    type: "string", default: "",
+    description: "Exact HTTP(S) TensorFold base URL ending in /v1; default TENSORFOLD_BASE_URL.",
+  });
   pi.registerFlag("decide-model", {
-    type: "string", default: "auto",
-    description: "Decision model as provider/id; auto uses the current chat model in an isolated call.",
+    type: "string", default: "",
+    description: "Exact served TensorFold model ID; default TENSORFOLD_MODEL. Calls POST /v1/decisions only.",
   });
   pi.registerFlag("decide-disabled", { type: "boolean", default: false, description: "Disable resource selection." });
   pi.registerCommand("decide", {
@@ -70,23 +69,18 @@ export default function skillDecision(pi: ExtensionAPI) {
       if (args.trim() === "stats") {
         const stats = {
           decisions: 0, selected: 0, fallback: 0, unknownUsage: 0,
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          unknownCost: 0, usage: { input: 0, output: 0, totalTokens: 0 },
           footerIncludesDecisionCost: false,
         };
         for (const entry of ctx.sessionManager.getBranch()) {
           if (entry.type !== "custom" || entry.customType !== "skill-decision") continue;
-          const audit = entry.data as { status: string; usage?: Usage };
+          const audit = entry.data as { status: string; usage?: DecisionUsage };
           stats.decisions++;
           if (audit.status === "selected") stats.selected++;
           else stats.fallback++;
+          stats.unknownCost++;
           if (!audit.usage) { stats.unknownUsage++; continue; }
-          for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
-            stats.usage[key] += audit.usage[key];
-          }
-          for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
-            stats.usage.cost[key] += audit.usage.cost[key];
-          }
+          for (const key of ["input", "output", "totalTokens"] as const) stats.usage[key] += audit.usage[key];
         }
         if (ctx.hasUI) ctx.ui.notify(JSON.stringify(stats), "info");
         else console.log(JSON.stringify(stats));
@@ -99,7 +93,10 @@ export default function skillDecision(pi: ExtensionAPI) {
         return;
       }
       const disabled = pi.getFlag("decide-disabled") === true;
-      if (ctx.hasUI) ctx.ui.notify(`decide: ${enabled && !disabled ? "on" : "off"}; model=${pi.getFlag("decide-model")}`, "info");
+      const configuredUrl = String(pi.getFlag("decide-url") || process.env.TENSORFOLD_BASE_URL || "");
+      const configuredModel = String(pi.getFlag("decide-model") || process.env.TENSORFOLD_MODEL || "");
+      if (ctx.hasUI) ctx.ui.notify(`decide: ${enabled && !disabled ? "on" : "off"}; ` +
+        `url=${configuredUrl || "not configured"}; model=${configuredModel || "not configured"}`, "info");
     },
   });
 
@@ -147,9 +144,7 @@ export default function skillDecision(pi: ExtensionAPI) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(new Error("DECISION_TIMEOUT")), TIMEOUT_MS);
       const signal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
-      let usage: Usage | undefined;
-      const requestedModel = String(pi.getFlag("decide-model") ?? "auto");
-      let provider: string | undefined;
+      let usage: DecisionUsage | undefined;
       let modelName: string | undefined;
       try {
         const skills = catalog;
@@ -169,40 +164,19 @@ export default function skillDecision(pi: ExtensionAPI) {
         // Only the settled path below can change Pi state.
         const selection = await decide(input, async (request) => {
           const choose = async () => {
-            const address = requestedModel === "auto" ? undefined : modelAddress(requestedModel);
-            const classifier = address ? ctx.modelRegistry.findOfType("classifier", ...address) : undefined;
-            if (classifier) {
-              // llama.cpp classifies one question per backend call. Never silently fan out.
-              if (classifier.api === "llama-cpp-classify") throw new Error("CLASSIFIER_FANOUT_UNSUPPORTED");
-              const result = await ctx.modelRegistry.classify(classifier, buildQuestions(request), {
-                signal, timeoutMs: TIMEOUT_MS, maxRetries: 0,
-              });
-              usage = result.usage;
-              provider = result.provider;
-              modelName = result.model;
-              if (result.stopReason !== "stop") throw new Error("CLASSIFIER_FAILED");
-              return classifierDecision(request, result.answers);
-            }
-            const model = address ? ctx.modelRegistry.find(...address) : ctx.model;
-            if (!model) throw new Error("MODEL_UNAVAILABLE");
-            // Reject before routing: the public registry cannot resolve a virtual model safely here.
-            if (model.api === "pi-virtual") throw new Error("VIRTUAL_DECISION_MODEL_UNSUPPORTED");
-            // Bedrock's AWS client ignores maxRetries and can retry the isolated decision.
-            if (model.api === "bedrock-converse-stream") throw new Error("DECISION_TRANSPORT_UNSUPPORTED");
-            const instructions = await readFile(new URL("../prompts/decide.md", import.meta.url), { encoding: "utf8", signal });
-            const result = await ctx.modelRegistry.streamSimple(model, {
-              systemPrompt: instructions,
-              messages: [{ role: "user", content: JSON.stringify(request), timestamp: Date.now() }],
-            }, { signal, timeoutMs: TIMEOUT_MS, transport: "sse", maxRetries: 0, maxTokens: 1024 }).result();
-            // Chat APIs initialize usage to zero even when no usage was reported.
-            usage = result.usage.totalTokens > 0 ? result.usage : undefined;
-            provider = result.provider;
+            // Direct TensorFold config only: Pi's registry, login state, and command
+            // headers are never consulted. Values are re-read for every decision.
+            const baseUrl = String(pi.getFlag("decide-url") || process.env.TENSORFOLD_BASE_URL || "");
+            const model = String(pi.getFlag("decide-model") || process.env.TENSORFOLD_MODEL || "");
+            if (!baseUrl.trim() || !model.trim()) throw new Error("DECISION_NOT_CONFIGURED");
+            if (model === "auto") throw new Error("INVALID_MODEL_ADDRESS");
+            signal.throwIfAborted();
+            const result = await tensorFoldDecision(request, {
+              baseUrl, model, apiKey: process.env.TENSORFOLD_API_KEY || undefined, signal,
+            });
+            usage = result.usage;
             modelName = result.model;
-            if (result.stopReason !== "stop" || result.content.some((block) => block.type === "toolCall")) {
-              throw new Error("DECISION_MODEL_FAILED");
-            }
-            const text = result.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("");
-            try { return JSON.parse(text); } catch { throw new Error("INVALID_DECISION_JSON"); }
+            return result.decision;
           };
           const decision = validateDecision(await choose(), request);
           signal.throwIfAborted();
@@ -223,7 +197,7 @@ export default function skillDecision(pi: ExtensionAPI) {
         }, signal);
         signal.throwIfAborted();
         pi.appendEntry("skill-decision", {
-          targetId: target.id, status: "selected", provider, model: modelName, decision: selection,
+          targetId: target.id, status: "selected", backend: "tensorfold", provider: "tensorfold", model: modelName, decision: selection,
           enrichment, durationMs: Date.now() - started, usage,
         });
         if (ctx.hasUI) ctx.ui.setStatus("skill-decision", `decide: ${selection.skills.length} skills / ${selection.tools.length} tools`);
@@ -232,7 +206,7 @@ export default function skillDecision(pi: ExtensionAPI) {
         const reason = signal.aborted ? (ctx.signal?.aborted ? "ABORTED" : "DECISION_TIMEOUT") :
           error instanceof Error && FALLBACK_REASONS.has(error.message) ? error.message : "DECISION_FAILED";
         pi.appendEntry("skill-decision", {
-          targetId: target.id, status: "fallback", reason, provider, model: modelName, durationMs: Date.now() - started, usage,
+          targetId: target.id, status: "fallback", reason, backend: "tensorfold", provider: "tensorfold", model: modelName, durationMs: Date.now() - started, usage,
         });
         if (ctx.hasUI) ctx.ui.setStatus("skill-decision", `decide: fallback (${reason})`);
       } finally {
