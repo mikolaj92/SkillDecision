@@ -1,0 +1,18 @@
+{
+  "object": "decisions",
+  "model": "tensorfold-fixture",
+  "prompt_format_version": 1,
+  "answers": {
+    "skill_0": {
+      "type": "yes_no",
+      "probabilities": { "yes": 0.8999999999999999, "no": 0.09999999999999998 },
+      "label_mass": 0.8333333333333335
+    },
+    "tool_0": {
+      "type": "yes_no",
+      "probabilities": { "yes": 0.09999999999999998, "no": 0.8999999999999999 },
+      "label_mass": 0.8333333333333335
+    }
+  },
+  "usage": { "prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7 }
+}
